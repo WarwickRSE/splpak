@@ -15,6 +15,7 @@
 !  * Cleaned up and added to the Ngmath library in 1998.
 !  * Latest revision to the original Fortran code: August, 1998
 !  * Jacob Williams : Jan 2023 : modernized this code.
+!  * Chris Brady : Jan 2024 : further modernised to use modern Fortran idiom in userspace - breaks backwards compatibility
 !
 !### License
 !    Copyright (C) 2000
@@ -22,7 +23,7 @@
 !    All Rights Reserved
 !    The use of this Software is governed by a License Agreement.
 
-    module splpak_module
+    module spline
 
     use iso_fortran_env
 
@@ -30,19 +31,40 @@
 
     private
 
-#ifdef REAL32
+#ifdef SPLINE_REAL32
     integer,parameter :: wp = real32   !! Real working precision [4 bytes]
-#elif REAL64
+#elif SPLINE_REAL64
     integer,parameter :: wp = real64   !! Real working precision [8 bytes]
-#elif REAL128
+#elif SPLINE_REAL128
     integer,parameter :: wp = real128  !! Real working precision [16 bytes]
 #else
     integer,parameter :: wp = real64   !! Real working precision if not specified [8 bytes]
 #endif
 
-    integer,parameter,public :: splpak_wp = wp   !! Working precision
+    integer,parameter,public :: spline_wp = wp   !! Working precision
+    !! * `  0`  No error.
+    integer,parameter,public :: spline_no_error = 0
+    !! * `101`  `NDIM` is < 1.
+    integer,parameter,public :: spline_ndim_bad = 101
+    !! * `102`  `NODES(IDIM)` is < 4 for some `IDIM`.
+    integer,parameter,public :: spline_nodes_bad = 102
+    !! * `103`  `XMIN(IDIM) = XMAX(IDIM)` for some `IDIM`.
+    integer,parameter,public :: spline_xminmax_bad = 103
+    !! * `104`  `NCF` (size of `COEF`) is `< NODES(1)*...*NODES(NDIM)`.
+    integer,parameter,public :: spline_coef_bad = 104
+    !! * `105`  `NDATA` is `< 1`.
+    integer,parameter,public :: spline_ndata_bad = 105
+    !! * `106`  `NWRK` (size of `WORK`) is too small.
+    integer,parameter,public :: spline_nwrk_bad = 106
+    !! * `107`  [[suprls]] failure (usually insufficient
+    !!   data) -- ordinarily occurs only if
+    !!   `XTRAP` is zero or `WDATA` contains all
+    !!   zeros.
+    integer,parameter,public :: spline_suprls_fail = 107
 
-    type,public :: splpak_type
+    real(wp),parameter :: tol = tiny(1.0_wp) !! small number tolerance
+
+    type,public :: spline_fitter
 
         !!### Usage
         !!
@@ -95,6 +117,10 @@
         integer :: mdim = 0
         real(wp),dimension(:),allocatable :: dx ! originally these were all size 4
         real(wp),dimension(:),allocatable :: dxin
+        real(wp),dimension(:),allocatable :: coef
+        real(wp),dimension(:),allocatable :: xmin
+        real(wp),dimension(:),allocatable :: xmax
+        integer,dimension(:),allocatable :: nodes
         integer,dimension(:),allocatable  :: ib
         integer,dimension(:),allocatable  :: ibmn
         integer,dimension(:),allocatable  :: ibmx
@@ -114,17 +140,31 @@
 
         private
 
-        generic,public   :: initialize => splcc, splcw !! compute the spline coefficients
-        generic,public   :: evaluate   => splfe, splde !! evaluate the spline
-        procedure,public :: destroy    => destroy_splpak !! destory the internal class variables
+        generic,public   :: initialize => splcc, splcw, splcc1d, splcw1d, &
+            splcc_autoRange, splcc1d_autoRange, splcw_autoRange, &
+            splcw1d_autoRange  !! compute the spline coefficients
+        generic,public   :: evaluate   => splfe, splfe1d !! evaluate the spline
+        generic,public   :: evaluate_deriv => splde, splde1d !! evaluate the derivative of the spline
+        generic,public   :: fit => splcc, splcw, splcc1d, splcw1d, &
+        splcc_autoRange, splcc1d_autoRange, splcw_autoRange, &
+        splcw1d_autoRange  !! compute the spline coefficients
+        procedure,public :: destroy    => destroy_spline !! destory the internal class variables
         procedure,private :: splcc
+        procedure,private :: splcc_autoRange
+        procedure,private :: splcc1d
+        procedure,private :: splcc1d_autoRange
         procedure,private :: splcw
+        procedure,private :: splcw_autoRange
+        procedure,private :: splcw1d
+        procedure,private :: splcw1d_autoRange
         procedure,private :: splfe
+        procedure,private :: splfe1d
         procedure,private :: splde
+        procedure,private :: splde1d
         procedure,private :: bascmp
         procedure,private :: suprls
 
-    end type splpak_type
+    end type spline_fitter
 
     contains
 !*****************************************************************************************
@@ -133,9 +173,9 @@
 !>
 !  Destroy the internal class variables.
 
-    subroutine destroy_splpak(me,ndim)
+    subroutine destroy_spline(me,ndim)
 
-        class(splpak_type),intent(inout) :: me
+        class(spline_fitter),intent(inout) :: me
         integer,intent(in),optional :: ndim
 
         if (allocated(me%dx))   deallocate(me%dx)
@@ -143,6 +183,10 @@
         if (allocated(me%ib))   deallocate(me%ib)
         if (allocated(me%ibmn)) deallocate(me%ibmn)
         if (allocated(me%ibmx)) deallocate(me%ibmx)
+        if (allocated(me%coef)) deallocate(me%coef)
+        if (allocated(me%nodes)) deallocate(me%nodes)
+        if (allocated(me%xmin)) deallocate(me%xmin)
+        if (allocated(me%xmax)) deallocate(me%xmax)
         if (present(ndim)) then
             allocate(me%dx  (ndim)); me%dx   = 0.0_wp
             allocate(me%dxin(ndim)); me%dxin = 0.0_wp
@@ -162,7 +206,7 @@
         me%k1     = 0
         me%errsum = 0.0_wp
 
-    end subroutine destroy_splpak
+    end subroutine destroy_spline
 !*****************************************************************************************
 
 !*****************************************************************************************
@@ -171,7 +215,7 @@
 !  splines.  This routine is called by routines [[SPLCW]] and [[SPLDE]]
 !  to compute `ICOL` and `BASM`, which are defined as follows:
 !
-!   * The `MDIM` indices in `IB` (defined in [[splpak_type]]) determine
+!   * The `MDIM` indices in `IB` (defined in [[spline_fitter]]) determine
 !     a specific node in the node grid (see routine [[SPLCC]] for a
 !     description of the node grid).  Every node is associated
 !     with an `MDIM`-dimensional basis function and a corresponding
@@ -205,7 +249,7 @@
 
 subroutine bascmp(me,x,nderiv,xmin,nodes,icol,basm)
 
-    class(splpak_type),intent(inout) :: me
+    class(spline_fitter),intent(inout) :: me
     real(wp),intent(in) :: x(:)
     integer,intent(in) :: nderiv(:)
     real(wp),intent(in) :: xmin(:)
@@ -270,7 +314,6 @@ subroutine bascmp(me,x,nderiv,xmin,nodes,icol,basm)
             end if
 
         case(5)
-
             !  1st derivative.
             z = x(idim) - xb
             fact = me%dxin(idim)
@@ -418,32 +461,221 @@ end subroutine cfaerr
 !  entry [[SPLCW]] description for a
 !  complete description.
 
-subroutine splcc(me,ndim,xdata,l1xdat,ydata,ndata,xmin,xmax,nodes, &
-                 xtrap,coef,ncf,work,nwrk,ierror)
+subroutine splcc(me, xdata, ydata, xmin, xmax, nodes, &
+                 xtrap, ierror)
 
-    class(splpak_type),intent(inout) :: me
-    integer,intent(in) :: ndim
-    integer,intent(in) :: l1xdat
-    integer,intent(in) :: ncf
-    integer,intent(in) :: nwrk
-    integer,intent(in) :: ndata
-    real(wp),intent(in) :: xdata(l1xdat,ndata)
-    real(wp),intent(in) :: ydata(ndata)
-    real(wp),intent(in) :: xmin(ndim)
-    real(wp),intent(in) :: xmax(ndim)
-    real(wp),intent(in) :: xtrap
-    integer,intent(in) :: nodes(ndim)
-    real(wp) :: work(nwrk)
-    real(wp),intent(out) :: coef(ncf)
-    integer,intent(out) :: ierror
+    class(spline_fitter),intent(inout) :: me
+    real(wp),intent(in) :: xdata(:,:)
+    real(wp),intent(in) :: ydata(:)
+    real(wp),intent(in) :: xmin(:)
+    real(wp),intent(in) :: xmax(:)
+    real(wp),intent(in),optional :: xtrap
+    integer,intent(in) :: nodes(:)
+    integer,intent(out), optional :: ierror
 
     real(wp),dimension(1),parameter :: wdata = -1.0_wp !! indicates to [[splcw]]
                                                        !! that weights are not used
 
-    call me%splcw(ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax,&
-                  nodes,xtrap,coef,ncf,work,nwrk,ierror)
+    call me%splcw(xdata,ydata,wdata,xmin,xmax,&
+                  nodes,xtrap,ierror)
 
 end subroutine splcc
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares for 1D data
+!
+!  The usage and arguments of this routine are
+!  identical to those for [[SPLCW]] except for the
+!  omission of the array of weights, `WDATA` and that xdata is a rank 1 array.  See
+!  entry [[SPLCW]] description for a
+!  complete description.
+
+subroutine splcc1d(me, xdata, ydata, xmin, xmax, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in) :: xmin
+real(wp),intent(in) :: xmax
+real(wp),intent(in),optional :: xtrap
+integer,intent(in) :: nodes
+integer,intent(out), optional :: ierror
+
+
+real(wp),dimension(1),parameter :: wdata = -1.0_wp !! indicates to [[splcw]]
+                                          !! that weights are not used
+
+call me%splcw1d(xdata,ydata,wdata,xmin,xmax,&
+     nodes,xtrap,ierror)
+
+end subroutine splcc1d
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares
+!
+! This version takes only the xdata and ydata arrays and automatically
+! calculates sensible xmin and xmax arrays from the xdata array.
+subroutine splcc_autoRange(me, xdata, ydata, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:,:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in),optional :: xtrap
+integer,intent(in) :: nodes(:)
+integer,intent(out), optional :: ierror
+
+real(wp), dimension(size(xdata,1)) :: xmin, xmax
+integer :: i
+do i=1,size(xdata,1)
+    xmin(i) = minval(xdata(i,:))
+    xmax(i) = maxval(xdata(i,:))
+end do
+
+call me%splcc(xdata,ydata,xmin,xmax,&
+     nodes,xtrap,ierror)
+
+end subroutine splcc_autoRange
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares for 1D data
+!
+! This version takes only the xdata and ydata arrays and automatically
+! calculates sensible xmin and xmax arrays from the xdata array.
+subroutine splcc1d_autoRange(me, xdata, ydata, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in),optional :: xtrap
+integer,intent(in) :: nodes
+integer,intent(out), optional :: ierror
+
+real(wp) :: xmin, xmax
+
+xmin = minval(xdata)
+xmax = maxval(xdata)
+
+call me%splcc1d(xdata,ydata,xmin,xmax,&
+     nodes,xtrap,ierror)
+
+end subroutine splcc1d_autoRange
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares for 1D data
+!
+!  The usage and arguments of this routine are
+!  identical to those for [[SPLCW]] except that xdata is a rank 1 array.  See
+!  entry [[SPLCW]] description for a
+!  complete description.
+
+subroutine splcw1d(me, xdata, ydata, wdata, xmin, xmax, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in) :: wdata(:)
+real(wp),intent(in) :: xmin
+real(wp),intent(in) :: xmax
+real(wp),intent(in), optional :: xtrap
+integer,intent(in) :: nodes
+integer,intent(out), optional :: ierror
+real(wp), pointer :: xdata_ptr(:,:)
+integer :: nodes_arr(1)
+real(wp) ::  xmin_arr(1), xmax_arr(1)
+
+!Use pointer remapping to make xdata a 2D array
+xdata_ptr(1:1,1:size(xdata)) => xdata(:)
+nodes_arr(1) = nodes
+xmin_arr(1) = xmin
+xmax_arr(1) = xmax
+
+call me%splcw(xdata_ptr,ydata,wdata,xmin_arr,xmax_arr,&
+     nodes_arr,xtrap,ierror)
+
+end subroutine splcw1d
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares
+!
+! This version takes only the xdata, ydata and wdata arrays and automatically
+! calculates sensible xmin and xmax arrays from the xdata array.
+subroutine splcw_autoRange(me, xdata, ydata, wdata, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:,:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in) :: wdata(:)
+real(wp),intent(in),optional :: xtrap
+integer,intent(in) :: nodes(:)
+integer,intent(out), optional :: ierror
+
+real(wp), dimension(size(xdata,1)) :: xmin, xmax
+integer :: i
+
+do i = 1, size(xdata,1)
+    xmin(i) = minval(xdata(i,:))
+    xmax(i) = maxval(xdata(i,:))
+end do
+
+call me%splcw(xdata, ydata, wdata, xmin, xmax,&
+     nodes,xtrap,ierror)
+
+end subroutine splcw_autoRange
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline coefficient
+!  calculation by least squares for 1D data
+!
+! This version takes only the xdata, ydata and wdata arrays and automatically
+! calculates sensible xmin and xmax arrays from the xdata array.
+subroutine splcw1d_autoRange(me, xdata, ydata, wdata, nodes, &
+    xtrap, ierror)
+
+class(spline_fitter),intent(inout) :: me
+real(wp),intent(in), target :: xdata(:)
+real(wp),intent(in) :: ydata(:)
+real(wp),intent(in) :: wdata(:)
+real(wp),intent(in),optional :: xtrap
+integer,intent(in) :: nodes
+integer,intent(out), optional :: ierror
+
+integer :: nodes_arr(1)
+real(wp), dimension(1) :: xmin, xmax
+real(wp), pointer :: xdata_ptr(:,:)
+
+xdata_ptr(1:1,1:size(xdata)) => xdata(:)
+nodes_arr(1) = nodes
+xmin = minval(xdata)
+xmax = maxval(xdata)
+
+call me%splcw(xdata_ptr, ydata, wdata, xmin, xmax,&
+     nodes_arr,xtrap,ierror)
+
+end subroutine splcw1d_autoRange
+
+
 !*****************************************************************************************
 
 !*****************************************************************************************
@@ -509,32 +741,11 @@ end subroutine splcc
 !  The execution time is roughly proportional
 !  to `NDATA*NCOF**2` where `NCOF = NODES(1)*...*NODES(NDIM)`.
 
-subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
-                 nodes,xtrap,coef,ncf,work,nwrk,ierror)
+subroutine splcw(me,xdata,ydata,wdata,xmin,xmax, &
+                 nodes,xtrap, ierror)
 
-    class(splpak_type),intent(inout) :: me
-    integer,intent(in) :: ndim !! The dimensionality of the problem.  The
-                               !! spline is a function of `NDIM` variables or
-                               !! coordinates and thus a point in the
-                               !! independent variable space is an `NDIM` vector.
-                               !! `NDIM` must be `>= 1`.
-    integer,intent(in) :: l1xdat !! The length of the 1st dimension of `XDATA` in
-                                 !! the calling program.  `L1XDAT` must be `>= NDIM`.
-                                 !!
-                                 !!#### Note:
-                                 !! For 1-dimensional problems `L1XDAT` is usually 1.
-    integer,intent(in) :: ncf !! The length of the array `COEF` in the calling
-                              !! program.  If `NCF` is `< NODES(1)*...*NODES(NDIM)`,
-                              !! a fatal error is diagnosed.
-    integer,intent(in) :: nwrk !! The length of the array `WORK` in the calling
-                               !! program.  If
-                               !! `NCOL = NODES(1)*...*NODES(NDIM)` is the total
-                               !! number of nodes, then a fatal error is
-                               !! diagnosed if `NWRK` is less than
-                               !! `NCOL*(NCOL+1)`.
-    integer,intent(in) :: ndata !! The number of data points mentioned in the
-                                !! above arguments.
-    real(wp),intent(in) :: xdata(l1xdat,ndata) !! A collection of locations for the data
+    class(spline_fitter),intent(inout) :: me
+    real(wp),intent(in) :: xdata(:,:) !! A collection of locations for the data
                                                !! values, i.e., points from the independent
                                                !! variable space.  This collection is a
                                                !! 2-dimensional array whose 1st dimension
@@ -548,7 +759,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                                                !! and ordering of the data points is arbitrary.
                                                !! The dimension of `XDATA` is assumed to be
                                                !! `XDATA(L1XDAT,NDATA)`.
-    real(wp),intent(in) :: ydata(ndata) !! A collection of data values corresponding to
+    real(wp),intent(in) :: ydata(:) !! A collection of data values corresponding to
                                         !! the points in `XDATA`.  `YDATA(IDATA)` is the
                                         !! data value associated with the point
                                         !! `(XDATA(1,IDATA),...,XDATA(NDIM,IDATA))` in the
@@ -586,19 +797,19 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                                     !! The dimension is assumed to be `WDATA(NDATA)`
                                     !! unless `WDATA(1) < 0.`, in which case the
                                     !! dimension is assumed to be 1.
-    real(wp),intent(in) :: xmin(ndim) !! A vector describing the lower extreme corner
+    real(wp),intent(in) :: xmin(:) !! A vector describing the lower extreme corner
                                       !! of the node grid.  A set of evenly spaced
                                       !! nodes is formed along each coordinate axis
                                       !! and `XMIN(IDIM)` is the location of the first
                                       !! node along the `IDIM` axis.  The dimension is
                                       !! assumed to be `XMIN(NDIM)`.
-    real(wp),intent(in) :: xmax(ndim) !! A vector describing the upper extreme corner
+    real(wp),intent(in) :: xmax(:) !! A vector describing the upper extreme corner
                                       !! of the node grid.  A set of evenly spaced
                                       !! nodes is formed along each coordinate axis
                                       !! and `XMAX(IDIM)` is the location of the last
                                       !! node along the `IDIM` axis.  The dimension is
                                       !! assumed to be `XMAX(NDIM)`.
-    real(wp),intent(in) :: xtrap !! A parameter to control extrapolation to data
+    real(wp),intent(in),optional :: xtrap !! A parameter to control extrapolation to data
                                  !! sparse areas.  The region described by `XMIN`
                                  !! and `XMAX` is divided into rectangles, the
                                  !! number of which is determined by `NODES`, and
@@ -621,7 +832,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                                  !! skipped, but a singular matrix
                                  !! can result if large portions of
                                  !! the region are without data.
-    integer,intent(in) :: nodes(ndim) !! A vector of integers describing the number of
+    integer,intent(in) :: nodes(:) !! A vector of integers describing the number of
                                       !! nodes along each axis.  `NODES(IDIM)` is the
                                       !! number of nodes (counting endpoints) along
                                       !! the `IDIM` axis and determines the flexibility
@@ -646,32 +857,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                                       !! represented by an `NDIM` vector
                                       !! `(X(1),...,X(NDIM))` where
                                       !! `X(IDIM) = XMIN(IDIM) + (IN(IDIM)-1) * DX(IDIM)`.
-    real(wp) :: work(nwrk) !! A workspace array for solving the least
-                           !! squares matrix generated by this routine.
-                           !! Its required size is a function of the total
-                           !! number of nodes in the node grid.  This
-                           !! total, `NCOL = NODES(1)*...*NODES(NDIM)`, is
-                           !! also the number of columns in the least
-                           !! squares matrix.  The length of the array `WORK`
-                           !! must equal or exceed `NCOL*(NCOL+1)`.
-    real(wp),intent(out) :: coef(ncf) !! The array of coefficients computed by this
-                                      !! routine.  Each coefficient corresponds to a
-                                      !! particular basis function which in turn
-                                      !! corresponds to a node in the node grid.  This
-                                      !! correspondence between the node grid and the
-                                      !! array `COEF` is as if `COEF` were an
-                                      !! `NDIM`-dimensional Fortran array with
-                                      !! dimensions `NODES(1),...,NODES(NDIM)`, i.e., to
-                                      !! store the array linearly, the leftmost
-                                      !! indices are incremented most frequently.
-                                      !! Hence the length of the `COEF` array must equal
-                                      !! or exceed the total number of nodes, which is
-                                      !! `NODES(1)*...*NODES(NDIM)`.  The computed array
-                                      !! `COEF` may be used with function [[SPLFE]]
-                                      !! (or [[SPLDE]]) to evaluate the spline (or its
-                                      !! derivatives) at an arbitrary point in `NDIM`
-                                      !! space.  The dimension is assumed to be `COEF(NCF)`.
-    integer,intent(out) :: ierror !! An error flag with the following meanings:
+    integer,intent(out),optional :: ierror !! An error flag with the following meanings:
                                   !!
                                   !! * `  0`  No error.
                                   !! * `101`  `NDIM` is < 1.
@@ -685,10 +871,11 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                                   !!   `XTRAP` is zero or `WDATA` contains all
                                   !!   zeros.
 
-    real(wp),dimension(:),allocatable :: x
+    real(wp),dimension(:),allocatable :: x, work
     integer,dimension(:),allocatable :: nderiv,in,inmx
     real(wp) :: xrng,swght,rowwt,rhs,basm,reserr,totlwt,&
-                bump,wtprrc,expect,dcwght
+                bump,wtprrc,expect,dcwght, xtrap_local
+    integer :: ndim, l1xdat, ndata, nwrk, ncf, ierror_local
     integer :: ncol,idim,nod,nwrk1,mdata,nwlft,irow,idata,&
                icol,it,lserr,iin,nrect,idimc,idm,jdm,inidim
     logical :: boundary
@@ -707,17 +894,32 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         !! consideration.
 
     ! size the arrays:
+    ndim = size(xdata,1)
+    l1xdat = ndim
+    ndata = size(xdata,2)
+    ncf = product(nodes)
+    allocate(work(ncf*(ncf+1)))
+    nwrk = size(work)
     call me%destroy(ndim)
+    allocate(me%coef(ncf))
     allocate(x(ndim))
     allocate(nderiv(ndim))
     allocate(in(ndim))
     allocate(inmx(ndim))
+    allocate(me%nodes,source=nodes)
+    allocate(me%xmin,source=xmin)
+    allocate(me%xmax,source=xmax)
 
-    ierror = 0
+    xtrap_local = 1.0_wp
+    if (present(xtrap)) xtrap_local = xtrap
+    if (present(ierror)) ierror = spline_no_error
+
+    ierror_local = spline_no_error
     me%mdim = ndim
     if (me%mdim<1) then
-        ierror = 101
-        call cfaerr(ierror, &
+        ierror_local = spline_ndim_bad
+        if(present(ierror)) ierror = ierror_local
+        call cfaerr(ierror_local, &
             ' splcc or splcw - NDIM is less than 1')
         return
     end if
@@ -726,9 +928,10 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
     do idim = 1,me%mdim
         nod = nodes(idim)
         if (nod<4) then
-            ierror = 102
-            call cfaerr(ierror, &
+            ierror_local = spline_nodes_bad
+            call cfaerr(ierror_local, &
                 ' splcc or splcw - NODES(IDIM) is less than 4 for some IDIM')
+            if(present(ierror)) ierror = ierror_local
             return
         end if
 
@@ -736,10 +939,11 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         !  product of nodes over all dimensions.
         ncol = ncol*nod
         xrng = xmax(idim) - xmin(idim)
-        if (xrng==0.0_wp) then
-            ierror = 103
-            call cfaerr(ierror, &
+        if (abs(xrng)<tol) then
+            ierror_local = spline_xminmax_bad
+            call cfaerr(ierror_local, &
                 ' splcc or splcw - XMIN(IDIM) equals XMAX(IDIM) for some IDIM')
+            if(present(ierror)) ierror = ierror_local
             return
         end if
 
@@ -749,34 +953,37 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         nderiv(idim) = 0
     end do
     if (ncol>ncf) then
-        ierror = 104
-        call cfaerr(ierror, &
+        ierror_local = spline_coef_bad
+        call cfaerr(ierror_local, &
             ' splcc or splcw - NCF (size of COEF) is too small')
+        if(present(ierror)) ierror = ierror_local
         return
     end if
     nwrk1 = 1
     mdata = ndata
     if (mdata<1) then
-        ierror = 105
-        call cfaerr(ierror, &
+        ierror_local = spline_ndata_bad
+        call cfaerr(ierror_local, &
             ' splcc or splcw - Ndata Is less than 1')
+        if(present(ierror)) ierror = ierror_local
         return
     end if
 
     !  SWGHT is a local variable = XTRAP, and can be considered a smoothing
     !  weight for data sparse areas.  If SWGHT == 0, no smoothing
     !  computations are performed.
-    swght = xtrap
+    swght = xtrap_local
 
     !  Set aside workspace for counting data points.
-    if (swght/=0.0_wp) nwrk1 = ncol + 1
+    if (abs(swght)>0.0_wp) nwrk1 = ncol + 1
 
     !  NWLFT is the length of the remaining workspace.
     nwlft = nwrk - nwrk1 + 1
     if (nwlft<1) then
-        ierror = 106
-        call cfaerr(ierror, &
+        ierror_local = spline_nwrk_bad
+        call cfaerr(ierror_local, &
             ' splcc or splcw - NWRK (size of WORK) is too small')
+        if(present(ierror)) ierror = ierror_local
         return
     end if
     irow = 0
@@ -796,7 +1003,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         if (wdata(1)>=0.0_wp) then
             rowwt = wdata(idata)
             !  Data points with 0 weight are ignored.
-            if (rowwt==0.0_wp) cycle
+            if (abs(rowwt)<tol) cycle
         end if
         irow = irow + 1
 
@@ -812,7 +1019,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         !  Its value is zero except for columns corresponding to functions
         !  which are nonzero at X.
         do icol = 1,ncol
-            coef(icol) = 0.0_wp
+            me%coef(icol) = 0.0_wp
         end do
 
         !  Compute the indices of basis functions which are nonzero at X.
@@ -820,7 +1027,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         !  to NODES-1.
         do idim = 1,me%mdim
             nod = nodes(idim)
-            it = me%dxin(idim)* (x(idim)-xmin(idim))
+            it = floor(me%dxin(idim)* (x(idim)-xmin(idim)))
             me%ibmn(idim) = min(max(it-1,0),nod-2)
             me%ib(idim) = me%ibmn(idim)
             me%ibmx(idim) = max(min(it+2,nod-1),1)
@@ -834,7 +1041,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
 
             !  BASCMP computes ICOL and BASM where BASM is the value at X of
             !  the N-dimensional basis function corresponding to column ICOL.
-            coef(icol) = rowwt*basm
+            me%coef(icol) = rowwt*basm
 
             !  Increment the basis indices.
             do idim = 1,me%mdim
@@ -846,11 +1053,12 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
         end do basis_index
 
         !  Send a row of the least squares matrix to the reduction routine.
-        call me%suprls(irow,coef,ncol,rhs,work(nwrk1),nwlft,coef,reserr,lserr)
+        call me%suprls(irow,me%coef,ncol,rhs,work(nwrk1),nwlft,me%coef,reserr,lserr)
         if (lserr/=0) then
-            ierror = 107
-            call cfaerr(ierror, ' splcc or splcw - suprls failure '//&
+            ierror_local = spline_suprls_fail
+            call cfaerr(ierror_local, ' splcc or splcw - suprls failure '//&
                                 '(this usually indicates insufficient input data)')
+            if(present(ierror)) ierror = ierror_local
         end if
     end do
 
@@ -859,7 +1067,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
     !  If SWGHT==0, the least squares matrix is complete and no
     !  smoothing rows are computed.
 
-    if (swght/=0.0_wp) then
+    if (abs(swght)>0.0_wp) then
 
         !  Initialize smoothing computations for data sparse areas.
         !  Derivative constraints will always have zero right hand side.
@@ -888,7 +1096,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
             ! BUMP is the weight associated with the data point.
             bump = 1.0_wp
             if (wdata(1)>=0.0_wp) bump = wdata(idata)
-            if (bump==0.0_wp) cycle
+            if (abs(bump)<tol) cycle
 
             ! Find the nearest node.
             iin = 0
@@ -963,7 +1171,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                 !  Its value is zero except for columns corresponding to functions
                 !  which are non-zero at the node.
                 do icol = 1,ncol
-                    coef(icol) = 0.0_wp
+                    me%coef(icol) = 0.0_wp
                 end do
 
                 !  The 2nd derivative of a function of MDIM variables may be thought
@@ -1008,7 +1216,7 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
 
                             !  BASCMP computes ICOL and BASM where BASM is the value at X of the
                             !  N-dimensional basis function corresponding to column ICOL.
-                            coef(icol) = rowwt*basm
+                            me%coef(icol) = rowwt*basm
 
                             !  Increment the basis indices.
                             do idim = 1,me%mdim
@@ -1022,12 +1230,13 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
                         end do basis
 
                         !  Send row of least squares matrix to reduction routine.
-                        call me%suprls(irow,coef,ncol,rhs,work(nwrk1),nwlft,coef,reserr,lserr)
+                        call me%suprls(irow,me%coef,ncol,rhs,work(nwrk1),nwlft,me%coef,reserr,lserr)
                         if (lserr/=0) then
-                            ierror = 107
-                            call cfaerr(ierror, &
+                            ierror_local = 107
+                            call cfaerr(ierror_local, &
                                 ' splcc or splcw - suprls failure '//&
                                 '(this usually indicates insufficient input data)')
+                            if(present(ierror)) ierror = ierror_local
                         end if
                     end do
                 end do
@@ -1049,16 +1258,50 @@ subroutine splcw(me,ndim,xdata,l1xdat,ydata,wdata,ndata,xmin,xmax, &
 
     !  Call for least squares solution in COEF array.
     irow = 0
-    call me%suprls(irow,coef,ncol,rhs,work(nwrk1),nwlft,coef,reserr,lserr)
+    call me%suprls(irow,me%coef,ncol,rhs,work(nwrk1),nwlft,me%coef,reserr,lserr)
     if (lserr/=0) then
-        ierror = 107
-        call cfaerr(ierror, &
+        ierror_local = 107
+        call cfaerr(ierror_local, &
             ' splcc or splcw - suprls failure '//&
             '(this usually indicates insufficient input data)')
+        if(present(ierror)) ierror = ierror_local
     end if
 
 end subroutine splcw
 !*****************************************************************************************
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline function evaluation.
+!
+!  Except for lack of derivative capability, this
+!  function is identical to function [[splde]] in
+!  usage, but takes a scalar argument 'x' and a
+!  scalar argument 'nderiv'
+!
+!### See also
+!  * [[splde]]
+!
+!@note `coef`, `xmin`, `xmax` and `nodes` must be exactly
+!      retained from the call to [[splcc]] (or [[splcw]]).
+
+function splde1d(me,x,nderiv,ierror)
+
+    class(spline_fitter),intent(inout) :: me
+    real(wp) :: splde1d
+    real(wp),intent(in) :: x
+    integer,intent(in) :: nderiv
+    integer,intent(out),optional :: ierror
+
+    integer,dimension(1) :: nderiv_arr
+    real(wp), dimension(1) :: x_arr
+
+    x_arr(1) = x
+    nderiv_arr(1) = nderiv
+
+    splde1d = me%splde(x_arr,nderiv_arr,ierror)
+
+end function splde1d
 
 !*****************************************************************************************
 !>
@@ -1086,73 +1329,21 @@ end subroutine splcw
 !@note `coef`, `xmin`, `xmax` and `nodes` must be exactly
 !      retained from the call to [[splcc]] (or [[splcw]]).
 
-function splde(me,ndim,x,nderiv,coef,xmin,xmax,nodes,ierror)
+function splde(me,x,nderiv,ierror)
 
-    class(splpak_type),intent(inout) :: me
+    class(spline_fitter),intent(inout) :: me
     real(wp) :: splde !! the function value returned is the partial
                       !! derivative (indicated by `nderiv`) of the
                       !! spline evaluated at `x`.
-    integer,intent(in) :: ndim !! the dimensionality of the problem.  the
-                               !! spline is a function of `ndim` variables or
-                               !! coordinates and thus a point in the
-                               !! independent variable space is an `ndim` vector.
-                               !! `ndim` must be in the range `1 <= ndim <= 4`.
-    real(wp),intent(in) :: x(ndim) !! an `ndim` vector describing the point in the
+    real(wp),intent(in) :: x(:) !! an `ndim` vector describing the point in the
                                    !! independent variable space at which the
                                    !! spline is to be evaluated.
-    real(wp),intent(out) :: coef(*) !! the array of coefficients which determine the
-                                    !! spline.  each coefficient corresponds to a
-                                    !! particular basis function which in turn
-                                    !! corresponds to a node in the node grid.  this
-                                    !! correspondence between the node grid and the
-                                    !! array `coef` is as if `coef` were an
-                                    !! ndim-dimensional fortran array with
-                                    !! dimensions `nodes(1),...,nodes(ndim)`, i.e., to
-                                    !! store the array linearly, the leftmost
-                                    !! indices are incremented most frequently.
-                                    !! coef may be computed by using routines [[splcc]]
-                                    !! or [[splcw]].
-                                    !!
-                                    !! the dimension is assumed to be
-                                    !! `coef(nodes(1)*...*nodes(ndim))`.
-    real(wp),intent(in) :: xmin(ndim) !! a vector describing the lower extreme corner
-                                      !! of the node grid.  a set of evenly spaced
-                                      !! nodes is formed along each coordinate axis
-                                      !! and `xmin(idim)` is the location of the first
-                                      !! node along the `idim` axis.
-    real(wp),intent(in) :: xmax(ndim) !! a vector describing the upper extreme corner
-                                      !! of the node grid.  a set of evenly spaced
-                                      !! nodes is formed along each coordinate axis
-                                      !! and `xmax(idim)` is the location of the last
-                                      !! node along the `idim` axis.
-    integer,intent(in) :: nderiv(ndim) !! an `ndim` vector of integers specifying the
+    integer,intent(in) :: nderiv(:) !! an `ndim` vector of integers specifying the
                                        !! partial derivative to be evaluated.  the
                                        !! order of the derivative along the `idim` axis
                                        !! is `nderiv(idim)`.  these integers must be in
                                        !! the range `0 <= nderiv(idim) <= 2`.
-    integer,intent(in) :: nodes(ndim) !! a vector of integers describing the number of
-                                      !! nodes along each axis.  `nodes(idim)` is the
-                                      !! the number of nodes (counting endpoints)
-                                      !! along the `idim` axis and determines the
-                                      !! flexibility of the spline in that coordinate
-                                      !! direction.  `nodes(idim)` must be >= 4 but
-                                      !! may be as large as the arrays `coef` and `work`
-                                      !! allow.
-                                      !!
-                                      !! *note:*  the node grid is completely defined by
-                                      !! the arguments `xmin`, `xmax` and `nodes`.
-                                      !! the spacing of this grid in the `idim`
-                                      !! coordinate direction is
-                                      !! `dx(idim) = (xmax(idim)-xmin(idim)) / (nodes(idim)-1)`.
-                                      !! a node in this grid may be indexed by
-                                      !! an `ndim` vector of integers
-                                      !! `(in(1),...,in(ndim))` where
-                                      !! `1 <= in(idim) <= nodes(idim)`.  the
-                                      !! location of such a node may be
-                                      !! represented by an `ndim` vector
-                                      !! `(x(1),...,x(ndim)) ` where
-                                      !! `x(idim) = xmin(idim)+(in(idim)-1) * dx(idim)`.
-    integer,intent(out) :: ierror !! an error flag with the following meanings:
+    integer,intent(out),optional :: ierror !! an error flag with the following meanings:
                                   !!
                                   !! *   0  no error.
                                   !! * 101  ndim is < 1 or is > 4.
@@ -1161,36 +1352,44 @@ function splde(me,ndim,x,nderiv,coef,xmin,xmax,nodes,ierror)
                                   !! * 104  nderiv(idim) is < 0 or is > 2 for some idim.
 
     real(wp) :: xrng,sum,basm
-    integer :: iibmx,idim,nod,it,iib,icof
+    integer :: iibmx,idim,nod,it,iib,icof,ndim,ierror_local
+    ndim = size(x)
 
-    ierror = 0
+    splde = 0.0_wp !Silence compiler warning on early termination
+
+    ierror_local = spline_no_error
+    if (present(ierror)) ierror = spline_no_error
     me%mdim = ndim
     if (me%mdim<1) then
-        ierror = 101
-        call cfaerr(ierror, &
+        ierror_local = spline_ndim_bad
+        call cfaerr(ierror_local, &
             ' splfe or splde - NDIM is less than 1')
+        if(present(ierror)) ierror = ierror_local
         return
     end if
     iibmx = 1
     do idim = 1,me%mdim
-        nod = nodes(idim)
+        nod = me%nodes(idim)
         if (nod<4) then
-            ierror = 102
-            call cfaerr(ierror, &
-                ' splfe or splde - NODES(IDIM) is less than  4for some IDIM')
+            ierror_local = spline_nodes_bad
+            call cfaerr(ierror_local, &
+                'splfe or splde - NODES(IDIM) is less than  4for some IDIM')
+            if(present(ierror)) ierror = ierror_local
             return
         end if
-        xrng = xmax(idim) - xmin(idim)
-        if (xrng==0.0_wp) then
-            ierror = 103
-            call cfaerr(ierror, &
+        xrng = me%xmax(idim) - me%xmin(idim)
+        if (abs(xrng)<tol) then
+            ierror_local = spline_xminmax_bad
+            call cfaerr(ierror_local, &
                 ' splfe or splde - XMIN(IDIM) = XMAX(IDIM) for some IDIM')
+            if(present(ierror)) ierror = ierror_local
             return
         end if
         if (nderiv(idim)<0 .or. nderiv(idim)>2) then
-            ierror = 104
-            call cfaerr(ierror, &
+            ierror_local = spline_coef_bad
+            call cfaerr(ierror_local, &
                 ' splde - NDERIV(IDIM) IS less than 0 or greater than 2 for some IDIM')
+            if(present(ierror)) ierror = ierror_local
         end if
 
         !  DX(IDIM) is the node spacing along the IDIM coordinate.
@@ -1198,7 +1397,7 @@ function splde(me,ndim,x,nderiv,coef,xmin,xmax,nodes,ierror)
         me%dxin(idim) = 1.0_wp/me%dx(idim)
 
         !  Compute indices of basis functions which are nonzero at X.
-        it = me%dxin(idim)*(x(idim)-xmin(idim))
+        it = floor(me%dxin(idim)*(x(idim)-me%xmin(idim)))
 
         !  IBMN must be in the range 0 to NODES-2.
         me%ibmn(idim) = min(max(it-1,0),nod-2)
@@ -1218,11 +1417,11 @@ function splde(me,ndim,x,nderiv,coef,xmin,xmax,nodes,ierror)
         iib = iib + 1
 
         !  The indices are in IB and are passed through common to BASCMP.
-        call me%bascmp(x,nderiv,xmin,nodes,icof,basm)
+        call me%bascmp(x,nderiv,me%xmin,me%nodes,icof,basm)
 
         !  BASCMP computes ICOF and BASM where BASM is the value at X of the
         !  N-dimensional basis function corresponding to COEF(ICOF).
-        sum = sum + coef(icof)*basm
+        sum = sum + me%coef(icof)*basm
         if (iib<iibmx) then
             !  Increment the basis indices.
             do idim = 1,me%mdim
@@ -1255,24 +1454,55 @@ end function splde
 !@note `coef`, `xmin`, `xmax` and `nodes` must be exactly
 !      retained from the call to [[splcc]] (or [[splcw]]).
 
-function splfe(me,ndim,x,coef,xmin,xmax,nodes,ierror)
+function splfe(me,x,ierror)
 
-    class(splpak_type),intent(inout) :: me
+    class(spline_fitter),intent(inout) :: me
     real(wp) :: splfe
-    integer,intent(in) :: ndim
-    real(wp),intent(in) :: x(ndim)
-    real(wp),intent(out) :: coef(*)
-    real(wp),intent(in) :: xmin(ndim)
-    real(wp),intent(in) :: xmax(ndim)
-    integer,intent(in) :: nodes(ndim)
-    integer,intent(out) :: ierror
+    real(wp),intent(in) :: x(:)
+    integer,intent(out),optional :: ierror
 
-    integer,dimension(ndim) :: nderiv
+    integer,dimension(size(x)) :: nderiv
 
     nderiv = 0
-    splfe = me%splde(ndim,x,nderiv,coef,xmin,xmax,nodes,ierror)
+    splfe = me%splde(x,nderiv,ierror)
 
 end function splfe
+
+
+!*****************************************************************************************
+!>
+!  N-dimensional cubic spline function evaluation.
+!
+!  Except for lack of derivative capability, this
+!  function is identical to function [[splde]] in
+!  usage.  The argument list is also identical
+!  except for the omission of `nderiv`.
+!  This version is 1D
+!
+!### See also
+!  * [[splde]]
+!
+!@note `coef`, `xmin`, `xmax` and `nodes` must be exactly
+!      retained from the call to [[splcc]] (or [[splcw]]).
+
+function splfe1d(me,x,ierror)
+
+    class(spline_fitter),intent(inout) :: me
+    real(wp) :: splfe1d
+    real(wp),intent(in) :: x
+    integer,intent(out),optional :: ierror
+
+    integer,dimension(1) :: nderiv
+    real(wp), dimension(1) :: x_arr
+
+    x_arr(1) = x
+
+    nderiv = 0
+    splfe1d = me%splde(x_arr,nderiv,ierror)
+
+end function splfe1d
+
+
 !*****************************************************************************************
 
 !*****************************************************************************************
@@ -1374,7 +1604,7 @@ end function splfe
 
 subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
 
-    class(splpak_type),intent(inout) :: me
+    class(spline_fitter),intent(inout) :: me
     integer,intent(in) :: i !! the index of the row being entered.  (`i` is 1
                             !! for the first call, increases by 1 for each
                             !! call, and is `m` when the final row is
@@ -1388,7 +1618,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
     integer,intent(in) :: n !! the length of the rows of the matrix (i.e.,
                             !! the number of columns). `n <= m`, where `m` is
                             !! the number of rows.
-    real(wp),intent(in) :: rowi(n) !! a vector which on the `i`th call contains the `n`
+    real(wp),intent(inout) :: rowi(n) !! a vector which on the `i`th call contains the `n`
                                    !! components of the `i`th row of the matrix.  the
                                    !! dimension of `rowi` in calling program must be
                                    !! at least `n`.
@@ -1396,7 +1626,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
                               !! of the right hand side vector `b`.
     real(wp),intent(inout) :: a(nn) !! a working array which must not be changed
                                     !! between the successive calls to [[suprls]].
-    real(wp),intent(out) :: soln(n) !! the `n`-components of the solution vector are
+    real(wp),intent(inout) :: soln(n) !! the `n`-components of the solution vector are
                                     !! returned in this array after the final call
                                     !! to [[suprls]].
     real(wp),intent(out) :: err !! the euclidean norm of the residual is
@@ -1419,8 +1649,6 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
                ilk,npk,ilii,npii
     logical :: complete_reduction !! Routine entered with `I<=0` means complete
                                   !! the reduction and store the solution in `SOLN`.
-
-    real(wp),parameter :: tol = 1.0e-18_wp !! small number tolerance
 
     ier = 0
     complete_reduction = i <= 0
@@ -1477,6 +1705,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
         if (i<me%l) return
 
     end if
+    i2=0
 
     main : do
 
@@ -1497,7 +1726,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
                         else
                             s = sqrt(a(idiag)*a(idiag)+a(i1)*a(i1))
                         end if
-                        if (s==0.0_wp) cycle
+                        if (abs(s) < tol) cycle
                         temp = a(idiag)
                         a(idiag) = s
                         s = 1.0_wp/s
@@ -1523,7 +1752,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
                         do ii = i1,i2,me%np1
                             s = s + a(ii)*a(ii)
                         end do
-                        if (s==0.0_wp) cycle
+                        if (abs(s)<tol) cycle
                         temp = a(idiag)
                         a(idiag) = sqrt(s)
                         if (temp>0.0_wp) a(idiag) = -a(idiag)
@@ -1582,7 +1811,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
                     do ii = i1,i2,me%np1
                         s = s + a(ii)*a(ii)
                     end do
-                    if (s==0.0_wp) cycle
+                    if (abs(s)<tol) cycle
                     temp = a(i1)
                     a(i1) = sqrt(s)
                     if (temp>0.0_wp) a(i1) = -a(i1)
@@ -1659,7 +1888,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
     end do main
 
     me%ilast = (me%np1* (me%np1+1))/2 - 1
-    if (a(me%ilast-1)==0.0_wp) then
+    if (abs(a(me%ilast-1))<tol) then
         ! Error return if system is singular.
         ier = 34
         call cfaerr(ier,' suprls - system is singular.')
@@ -1679,7 +1908,7 @@ subroutine suprls(me,i,rowi,n,bi,a,nn,soln,err,ier)
         end do
         me%k = k ! JW : is this necessary ???
         ilii = me%ilast - ii
-        if (a(ilii)==0.0_wp) then
+        if (abs(a(ilii))<tol) then
             ! Error return if system is singular.
             ier = 34
             call cfaerr(ier,' suprls - system is singular.')
@@ -1696,5 +1925,5 @@ end subroutine suprls
 !*****************************************************************************************
 
 !*****************************************************************************************
-    end module splpak_module
+    end module spline
 !*****************************************************************************************
